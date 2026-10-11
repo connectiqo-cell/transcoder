@@ -9,7 +9,7 @@
     "start": "node index.js",
     "test": "node --test"
   },
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "dependencies": {
     "@supabase/supabase-js": "^2.58.0"
   }

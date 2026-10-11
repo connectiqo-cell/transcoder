@@ -1,4 +1,7 @@
-FROM node:20-alpine
+# Node 22, not 20: supabase-js eagerly builds a Realtime client that needs a
+# global WebSocket, which Node 20 does not have. We never use realtime, but
+# createClient initialises it anyway and throws on boot.
+FROM node:22-alpine
 
 # ffmpeg + ffprobe from Alpine's repo: no custom build, no GPL codec surprises
 # beyond what the distro already ships.
