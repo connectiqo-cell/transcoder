@@ -1,0 +1,47 @@
+services:
+  transcoder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: connectiqo-transcoder
+    restart: unless-stopped
+
+    # Bound to localhost only, same as the web app: Caddy on this VPS is the sole
+    # public entry point and terminates TLS. Without the 127.0.0.1 prefix Docker
+    # binds all interfaces, exposing this over plain HTTP at http://<vps-ip>:8080 —
+    # and this service holds the Supabase service role key, which bypasses all RLS.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    env_file:
+      - .env
+
+    environment:
+      NODE_ENV: production
+
+    # ffmpeg will take every core it is given. Capping it keeps the website
+    # container on this same VPS responsive while a video is encoding.
+    # Raise this if transcoding backs up and the box has headroom.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2G
+
+    # Encoding happens in /tmp; tmpfs keeps it off the disk and guarantees
+    # cleanup on restart, so a crashed job cannot leak segments onto the volume.
+    tmpfs:
+      - /tmp:size=4g
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

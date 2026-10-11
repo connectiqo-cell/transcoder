@@ -1,0 +1,16 @@
+{
+  "name": "connectiqo-transcoder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "HLS ABR transcoding worker for mentor videos",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.58.0"
+  }
+}
