@@ -66,6 +66,7 @@ nano .env
 | `SUPABASE_URL` | Supabase dashboard → Settings → API → Project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Same page → `service_role` **secret**. Server only. |
 | `WEBHOOK_SECRET` | Generate one: `openssl rand -hex 32` |
+| `HOST_PORT` | Only if 8080 is taken on the box. Check with `sudo ss -tlnp \| grep 8080`, pick a free port, and point Caddy at the same one. |
 
 ### 3. Start it
 
@@ -81,7 +82,7 @@ In `/etc/caddy/Caddyfile`, alongside the existing app entry:
 
 ```caddy
 transcode.connectiqo.com {
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy 127.0.0.1:8080   # match HOST_PORT from .env
 
     # Only Supabase's webhook should reach this. Everything else gets nothing.
     @notwebhook {
