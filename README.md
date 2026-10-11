@@ -85,9 +85,8 @@ transcode.connectiqo.com {
     reverse_proxy 127.0.0.1:8080   # match HOST_PORT from .env
 
     # Only Supabase's webhook should reach this. Everything else gets nothing.
-    @notwebhook {
-        not path /transcode /health
-    }
+    # Single-matcher shorthand: a named matcher cannot take `{ ... }` inline.
+    @notwebhook not path /transcode /health
     respond @notwebhook 404
 }
 ```
