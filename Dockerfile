@@ -5,7 +5,7 @@ FROM node:22-alpine
 
 # ffmpeg + ffprobe from Alpine's repo: no custom build, no GPL codec surprises
 # beyond what the distro already ships.
-RUN apk add --no-cache ffmpeg
+RUN apk add --no-cache ffmpeg font-dejavu
 
 WORKDIR /app
 COPY package.json ./

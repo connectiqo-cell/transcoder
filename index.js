@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp } from 'node:fs/promises';
 import { createClient } from '@supabase/supabase-js';
-import { buildHls, readLocal, cleanup } from './transcode.js';
+import { buildHls, drawWatermark, readLocal, cleanup } from './transcode.js';
 
 const {
   SUPABASE_URL,
@@ -18,6 +18,22 @@ for (const [k, v] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, W
   if (!v) throw new Error(`Missing required env var: ${k}`);
 }
 
+// CollabHub submissions: fixed bucket names, created by the website's migration
+// (campaign-submissions is private, -watermarked is public).
+// ponytail: fixed 5-minute sweep, no backoff. A row that fails every sweep
+// burns one ffmpeg run per 5 min; add an attempt counter if that shows up.
+const SWEEP_MS = 5 * 60 * 1000;
+const SUBMISSIONS_BUCKET = 'campaign-submissions';
+const WATERMARKED_BUCKET = 'campaign-submissions-watermarked';
+// Long enough for ffmpeg to stream a big file end to end.
+const SIGNED_URL_TTL = 60 * 60;
+const CONTENT_TYPE_BY_EXT = {
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+};
+
 // Service role: the worker writes HLS output and status on behalf of the system,
 // so it must not be subject to the per-mentor RLS policies.
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -27,8 +43,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 // ponytail: one job at a time, in-process. ffmpeg is CPU-bound, so running N jobs in
 // parallel on a small box just thrashes. Swap for a real queue if throughput matters.
 let chain = Promise.resolve();
-const enqueue = (fn) => {
-  chain = chain.then(fn).catch(e => console.error('[queue]', e?.message || e));
+// Keyed in-flight set: the periodic sweep and a webhook can name the same job,
+// and running ffmpeg twice over one row wastes the one CPU slot there is.
+const inFlight = new Set();
+const enqueue = (key, fn) => {
+  if (inFlight.has(key)) return chain;
+  inFlight.add(key);
+  chain = chain
+    .then(fn)
+    .catch(e => console.error('[queue]', e?.message || e))
+    .finally(() => inFlight.delete(key));
   return chain;
 };
 
@@ -98,7 +122,90 @@ async function transcodeVideo(videoId) {
   }
 }
 
-/** A crash leaves rows stuck in 'processing'; reclaim them on boot. */
+/**
+ * CollabHub: watermark one creator submission so the brand can review it
+ * without getting the usable file. Same shape as transcodeVideo above —
+ * read, ffmpeg, upload, flip the row. The output is a small review proxy,
+ * not a copy of the original (see drawWatermark).
+ */
+async function watermarkSubmission(submissionId) {
+  const { data: sub, error } = await supabase
+    .from('campaign_submissions')
+    .select('id, original_storage_path, status, watermark_error')
+    .eq('id', submissionId)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!sub?.original_storage_path) return;
+  // Only 'processing' is ours to act on; a resubmission sets it back to that.
+  if (sub.status !== 'processing') return;
+  // A failure writes watermark_error, and that UPDATE fires the webhook again.
+  // Without this the row would retry itself forever, pinning the one CPU slot.
+  // Retries are deliberate instead: the sweep clears the error, as does a
+  // resubmission.
+  if (sub.watermark_error) return;
+
+  let workDir;
+  try {
+    // Signed URL, not download(): ffmpeg streams it, so a 500MB submission
+    // never becomes a 500MB Buffer in this process.
+    const { data: signed, error: signErr } = await supabase.storage
+      .from(SUBMISSIONS_BUCKET).createSignedUrl(sub.original_storage_path, SIGNED_URL_TTL);
+    if (signErr) throw signErr;
+
+    // Extension comes from a client-chosen storage key: whitelist it, so an odd
+    // value cannot land in a temp path or a Content-Type.
+    const rawExt = (sub.original_storage_path.split('.').pop() || '').toLowerCase();
+    const ext = rawExt in CONTENT_TYPE_BY_EXT ? rawExt : 'mp4';
+    workDir = await mkdtemp(join(tmpdir(), 'wm-'));
+    const outName = `watermarked.${ext}`;
+    await drawWatermark(signed.signedUrl, join(workDir, outName));
+
+    // Same object path in the watermarked bucket, so the pair is obvious.
+    const { error: upErr } = await supabase.storage.from(WATERMARKED_BUCKET).upload(
+      sub.original_storage_path,
+      await readLocal(workDir, outName),
+      {
+        upsert: true,
+        contentType: CONTENT_TYPE_BY_EXT[ext],
+        // Paths are timestamped per submission, so the object never changes
+        // under a URL — cache it like the HLS segments.
+        cacheControl: '31536000',
+      },
+    );
+    if (upErr) throw upErr;
+
+    const { data: pub } = supabase.storage
+      .from(WATERMARKED_BUCKET).getPublicUrl(sub.original_storage_path);
+
+    const { error: updErr } = await supabase.from('campaign_submissions').update({
+      watermarked_storage_path: sub.original_storage_path,
+      watermarked_video_url: pub.publicUrl,
+      status: 'submitted',
+      watermark_error: null,
+      updated_at: new Date().toISOString(),
+    }).eq('id', submissionId);
+    if (updErr) throw updErr;
+
+    console.log(`[watermark] ${submissionId} submitted`);
+  } catch (e) {
+    console.error(`[watermark] ${submissionId} failed:`, e?.message || e);
+    // Status stays 'processing' so the sweep can pick it up again; the
+    // creator's screen reads watermark_error instead of spinning forever.
+    await supabase.from('campaign_submissions').update({
+      watermark_error: String(e?.message || e).slice(0, 500),
+      updated_at: new Date().toISOString(),
+    }).eq('id', submissionId);
+  } finally {
+    if (workDir) await cleanup(workDir);
+  }
+}
+
+/**
+ * A crash leaves rows stuck mid-job, and Supabase webhooks are fire-and-forget,
+ * so nothing else retries. Runs on boot and on an interval; the in-flight set
+ * keeps a sweep from re-enqueuing work already running.
+ */
 async function requeueStuck() {
   const { data } = await supabase
     .from('mentor_videos')
@@ -106,8 +213,26 @@ async function requeueStuck() {
     .in('transcode_status', ['pending', 'processing'])
     .order('created_at', { ascending: true })
     .limit(50);
-  for (const row of data || []) enqueue(() => transcodeVideo(row.id));
-  if (data?.length) console.log(`[boot] requeued ${data.length} job(s)`);
+  for (const row of data || []) enqueue(`v:${row.id}`, () => transcodeVideo(row.id));
+  if (data?.length) console.log(`[boot] requeued ${data.length} transcode job(s)`);
+
+  // Clearing watermark_error is what makes a failed row eligible again — see
+  // the guard in watermarkSubmission.
+  const { data: subs } = await supabase
+    .from('campaign_submissions')
+    .update({ watermark_error: null })
+    .eq('status', 'processing')
+    .not('watermark_error', 'is', null)
+    .select('id');
+  const { data: fresh } = await supabase
+    .from('campaign_submissions')
+    .select('id')
+    .eq('status', 'processing')
+    .is('watermark_error', null)
+    .order('submitted_at', { ascending: true })
+    .limit(50);
+  for (const row of fresh || []) enqueue(`s:${row.id}`, () => watermarkSubmission(row.id));
+  if (subs?.length) console.log(`[sweep] cleared ${subs.length} failed watermark job(s) for retry`);
 }
 
 const readBody = (req) =>
@@ -122,7 +247,8 @@ http.createServer(async (req, res) => {
     res.writeHead(200).end('ok');
     return;
   }
-  if (req.method !== 'POST' || req.url !== '/transcode') {
+  const route = req.method === 'POST' ? req.url : null;
+  if (route !== '/transcode' && route !== '/watermark') {
     res.writeHead(404).end();
     return;
   }
@@ -131,24 +257,28 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  let videoId;
+  let id;
   try {
     const body = JSON.parse(await readBody(req));
-    // Accepts a Supabase database webhook payload or a plain { videoId }.
-    videoId = body?.record?.id || body?.videoId;
+    // Accepts a Supabase database webhook payload or a plain id.
+    id = body?.record?.id || body?.videoId || body?.submissionId;
   } catch {
     res.writeHead(400).end('bad json');
     return;
   }
-  if (!videoId) {
-    res.writeHead(400).end('missing videoId');
+  if (!id) {
+    res.writeHead(400).end('missing id');
     return;
   }
 
-  // Ack immediately: transcoding takes far longer than any webhook timeout.
+  // Ack immediately: ffmpeg takes far longer than any webhook timeout.
   res.writeHead(202).end('queued');
-  enqueue(() => transcodeVideo(videoId));
+  enqueue(
+    route === '/watermark' ? `s:${id}` : `v:${id}`,
+    () => (route === '/watermark' ? watermarkSubmission(id) : transcodeVideo(id)),
+  );
 }).listen(PORT, () => {
   console.log(`[transcoder] listening on ${PORT}`);
   requeueStuck();
+  setInterval(requeueStuck, SWEEP_MS).unref();
 });

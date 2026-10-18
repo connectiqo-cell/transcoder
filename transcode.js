@@ -65,3 +65,42 @@ export async function buildHls(inputFile) {
 
 export const readLocal = (dir, name) => readFile(join(dir, name));
 export const cleanup = (dir) => rm(dir, { recursive: true, force: true }).catch(() => {});
+
+// Alpine's font-dejavu package (see Dockerfile). drawtext needs an explicit
+// fontfile — the image ships no fontconfig families to resolve a bare name.
+export const WATERMARK_FONT =
+  process.env.WATERMARK_FONT || '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf';
+
+// The review copy is deliberately small: the brand is judging the content, not
+// buying this file. 480 on the short side costs ~5x less CPU and storage than
+// full res, and what leaks is visibly worse than what they pay for. min() keeps
+// it from upscaling a smaller source, and -2 lets the long side follow.
+const REVIEW_SCALE =
+  "scale='if(gt(iw,ih),-2,min(480,iw))':'if(gt(iw,ih),min(480,ih),-2)'";
+
+/**
+ * Burn the semi-transparent "Connectiqo" watermark into `input` (a local file
+ * or a URL ffmpeg can read — a signed URL streams, which keeps whole videos
+ * out of this process's memory).
+ *
+ * This is the copy a brand reviews before paying; the clean original is never
+ * shown to them. Video is re-encoded (the text has to live in the pixels),
+ * audio is copied untouched.
+ */
+export async function drawWatermark(input, outputFile, fontFile = WATERMARK_FONT) {
+  await run('ffmpeg', [
+    '-y', '-i', input,
+    '-vf',
+    `${REVIEW_SCALE},drawtext=fontfile=${fontFile}:text='Connectiqo'` +
+      // fontsize scales with the frame: a fixed 28px is a fleck on 1080p.
+      ':fontcolor=white@0.45:fontsize=h/18:x=(w-text_w)/2:y=(h-text_h)/2' +
+      ':shadowcolor=black@0.4:shadowx=2:shadowy=2',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26',
+    '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+    // Front-load the moov atom so the brand's player starts immediately
+    // instead of fetching the whole file first.
+    '-movflags', '+faststart',
+    '-codec:a', 'copy',
+    outputFile,
+  ]);
+}

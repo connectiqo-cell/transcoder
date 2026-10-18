@@ -86,7 +86,7 @@ transcode.connectiqo.com {
 
     # Only Supabase's webhook should reach this. Everything else gets nothing.
     # Single-matcher shorthand: a named matcher cannot take `{ ... }` inline.
-    @notwebhook not path /transcode /health
+    @notwebhook not path /transcode /watermark /health
     respond @notwebhook 404
 }
 ```
@@ -110,6 +110,27 @@ Apply `migration.sql` first (paste it into Supabase → SQL Editor), then in the
 - Header `x-webhook-secret: <WEBHOOK_SECRET>`
 
 The worker reads `record.id` from the payload, or accepts a plain `{"videoId":"…"}`.
+
+### CollabHub watermarking
+
+Same worker, second endpoint. Apply `migration_collabhub_watermark.sql`, then add a
+second webhook:
+
+- Table `campaign_submissions`, events **Insert** and **Update**
+- URL `https://<your-host>/watermark`
+- Same `x-webhook-secret` header
+
+The creator's app inserts the submission row with `status='processing'` and stops
+there — no client-side call to any API. This worker downloads the clean original
+from `campaign-submissions`, burns in the watermark, uploads to
+`campaign-submissions-watermarked`, and flips the row to `submitted` with
+`watermarked_video_url` set. Rows in any other status are ignored, so the Update
+event is safe to subscribe to (a resubmission sets `processing` again, which is
+what re-triggers it).
+
+Failures write `watermark_error` and leave the status on `processing`, so the
+creator sees a real error with a retry instead of a permanent spinner, and a
+restart requeues the job.
 
 ## Behaviour worth knowing
 
@@ -136,8 +157,11 @@ curl -X POST https://<your-host>/transcode \
 ## Tests
 
 ```bash
-node --test ladder.test.js
+node --test
 ```
+
+`watermark.test.js` runs real ffmpeg and skips itself where ffmpeg or the DejaVu
+font is missing — so it is a no-op on a dev laptop and a real check in the image.
 
 Covers the ladder maths: portrait vs landscape sizing, no upscaling, even dimensions,
 and master manifest output. The ffmpeg invocation itself is not unit tested — verify
