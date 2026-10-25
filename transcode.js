@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { selectRungs, scaleFilter, buildMasterManifest } from './ladder.js';
@@ -71,12 +71,37 @@ export const cleanup = (dir) => rm(dir, { recursive: true, force: true }).catch(
 export const WATERMARK_FONT =
   process.env.WATERMARK_FONT || '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf';
 
+// Cap the short side at `px` whichever way the video is oriented. min() keeps
+// it from upscaling a smaller source, and -2 lets the long side follow.
+const shortSideScale = (px) =>
+  `scale='if(gt(iw,ih),-2,min(${px},iw))':'if(gt(iw,ih),min(${px},ih),-2)'`;
+
 // The review copy is deliberately small: the brand is judging the content, not
 // buying this file. 480 on the short side costs ~5x less CPU and storage than
-// full res, and what leaks is visibly worse than what they pay for. min() keeps
-// it from upscaling a smaller source, and -2 lets the long side follow.
-const REVIEW_SCALE =
-  "scale='if(gt(iw,ih),-2,min(480,iw))':'if(gt(iw,ih),min(480,ih),-2)'";
+// full res, and what leaks is visibly worse than what they pay for.
+const REVIEW_SCALE = shortSideScale(480);
+
+/**
+ * Pull one frame out of `inputFile` as a JPEG poster, for videos whose owner
+ * never picked a cover image. A second in by default: the opening frame of a
+ * phone recording is very often black or mid fade-in. Clips shorter than that
+ * have no frame at 1s, so those fall back to the first frame.
+ */
+export async function grabPoster(inputFile, outputFile) {
+  const args = (seek) => [
+    // -ss ahead of -i seeks by keyframe before decoding: near-free on a long file.
+    '-y', '-ss', String(seek), '-i', inputFile,
+    '-frames:v', '1', '-vf', shortSideScale(720),
+    '-q:v', '3', outputFile,
+  ];
+  // A too-short clip can leave ffmpeg exiting 0 with an empty file, so size is
+  // the check that matters, not the exit code.
+  try {
+    await run('ffmpeg', args(1));
+    if ((await stat(outputFile)).size > 0) return;
+  } catch { /* fall through to the first frame */ }
+  await run('ffmpeg', args(0));
+}
 
 /**
  * Burn the semi-transparent "Connectiqo" watermark into `input` (a local file

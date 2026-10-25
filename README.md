@@ -33,6 +33,18 @@ Rungs are sized by the **short side**, so vertical feed video scales correctly
 CRF targets a quality level rather than a fixed bitrate, so the encoder spends bits
 where the content needs them and **never inflates an already-efficient source**.
 
+### Poster frames
+
+A video whose owner never picked a cover image also gets one frame pulled out of it
+(1s in, short side capped at 720, written to `mentor-videos-thumbnail` as
+`<mentor id>/<video id>_poster.jpg`) and `thumbnail_url` set. A hand-picked cover is
+never overwritten. Clips shorter than a second fall back to their first frame.
+
+This is server-side on purpose: the apps and the website all upload through this
+worker, so neither client needs frame-grabbing code, and old videos get posters too.
+The sweep below picks up every row with a null `thumbnail_url`, including ones that
+already transcoded — those skip the ladder and only get the frame.
+
 ## Deploy
 
 This follows the same pattern as the web app on your VPS: the container binds to
@@ -143,6 +155,9 @@ restart requeues the job.
   the original stays playable.
 
 ## Backfilling existing videos
+
+Missing **posters** need nothing: the 5-minute sweep finds every row with a null
+`thumbnail_url` and fills it in, 50 at a time.
 
 The migration marks pre-existing rows `skipped` so they are left alone. To transcode
 them, POST their ids:

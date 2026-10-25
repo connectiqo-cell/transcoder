@@ -1,10 +1,10 @@
 import http from 'node:http';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp } from 'node:fs/promises';
 import { createClient } from '@supabase/supabase-js';
-import { buildHls, drawWatermark, readLocal, cleanup } from './transcode.js';
+import { buildHls, drawWatermark, grabPoster, readLocal, cleanup } from './transcode.js';
 
 const {
   SUPABASE_URL,
@@ -13,6 +13,9 @@ const {
   PORT = 8080,
   BUCKET = 'mentor-videos',
 } = process.env;
+
+// Same bucket the apps upload a hand-picked cover to.
+const THUMB_BUCKET = 'mentor-videos-thumbnail';
 
 for (const [k, v] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, WEBHOOK_SECRET })) {
   if (!v) throw new Error(`Missing required env var: ${k}`);
@@ -56,20 +59,30 @@ const enqueue = (key, fn) => {
   return chain;
 };
 
-async function transcodeVideo(videoId) {
+// `posterOnly` is for the backfill sweep: it must never start a ladder encode on
+// an old video the migration deliberately marked 'skipped'. A webhook or a manual
+// POST still transcodes whatever it is handed.
+async function transcodeVideo(videoId, { posterOnly = false } = {}) {
   const { data: video, error } = await supabase
     .from('mentor_videos')
-    .select('id, storage_path, transcode_status')
+    .select('id, mentor_id, storage_path, transcode_status, thumbnail_url')
     .eq('id', videoId)
     .maybeSingle();
 
   if (error) throw error;
   if (!video?.storage_path) return;
-  if (video.transcode_status === 'ready') return;
 
-  await supabase.from('mentor_videos')
-    .update({ transcode_status: 'processing', transcode_error: null })
-    .eq('id', videoId);
+  // A row can come back here only for its poster — an older video that was
+  // transcoded before posters existed, or one whose owner never picked a cover.
+  const needsHls = !posterOnly && video.transcode_status !== 'ready';
+  const needsPoster = !video.thumbnail_url;
+  if (!needsHls && !needsPoster) return;
+
+  if (needsHls) {
+    await supabase.from('mentor_videos')
+      .update({ transcode_status: 'processing', transcode_error: null })
+      .eq('id', videoId);
+  }
 
   let workDir;
   let hlsDir;
@@ -81,6 +94,29 @@ async function transcodeVideo(videoId) {
     workDir = await mkdtemp(join(tmpdir(), 'src-'));
     const srcFile = join(workDir, 'source.mp4');
     await writeFile(srcFile, Buffer.from(await blob.arrayBuffer()));
+
+    if (needsPoster) {
+      // Fixed path per video: a re-run overwrites its own poster instead of
+      // leaving an orphan behind in the bucket.
+      const posterPath = `${video.mentor_id}/${videoId}_poster.jpg`;
+      const posterFile = join(workDir, 'poster.jpg');
+      await grabPoster(srcFile, posterFile);
+      const { error: posterErr } = await supabase.storage.from(THUMB_BUCKET).upload(
+        posterPath,
+        await readFile(posterFile),
+        { upsert: true, contentType: 'image/jpeg', cacheControl: '31536000' },
+      );
+      if (posterErr) throw posterErr;
+      const { data: posterPub } = supabase.storage.from(THUMB_BUCKET).getPublicUrl(posterPath);
+      // Written now, not with the hls_url below: the ladder takes minutes on a
+      // long video and the card should stop looking broken within seconds.
+      await supabase.from('mentor_videos')
+        .update({ thumbnail_url: posterPub.publicUrl })
+        .eq('id', videoId);
+      console.log(`[poster] ${videoId} generated`);
+    }
+
+    if (!needsHls) return;
 
     const { dir, files, masterName } = await buildHls(srcFile);
     hlsDir = dir;
@@ -112,10 +148,13 @@ async function transcodeVideo(videoId) {
     console.log(`[transcode] ${videoId} ready (${files.length} files)`);
   } catch (e) {
     console.error(`[transcode] ${videoId} failed:`, e?.message || e);
-    await supabase.from('mentor_videos').update({
-      transcode_status: 'failed',
-      transcode_error: String(e?.message || e).slice(0, 500),
-    }).eq('id', videoId);
+    // A poster-only run must not reopen a row that already transcoded fine.
+    if (needsHls) {
+      await supabase.from('mentor_videos').update({
+        transcode_status: 'failed',
+        transcode_error: String(e?.message || e).slice(0, 500),
+      }).eq('id', videoId);
+    }
   } finally {
     if (workDir) await cleanup(workDir);
     if (hlsDir) await cleanup(hlsDir);
@@ -215,6 +254,22 @@ async function requeueStuck() {
     .limit(50);
   for (const row of data || []) enqueue(`v:${row.id}`, () => transcodeVideo(row.id));
   if (data?.length) console.log(`[boot] requeued ${data.length} transcode job(s)`);
+
+  // Videos with no cover image: the ones uploaded before posters existed, and
+  // any whose insert webhook never landed. Poster only — an old 'skipped' row
+  // stays skipped, exactly as the transcode migration intended.
+  // ponytail: no failure marker, so a video ffmpeg can never read is re-downloaded
+  // every sweep. Add a poster_error column if that ever shows up in the logs.
+  const { data: noPoster } = await supabase
+    .from('mentor_videos')
+    .select('id')
+    .is('thumbnail_url', null)
+    .order('created_at', { ascending: true })
+    .limit(50);
+  for (const row of noPoster || []) {
+    enqueue(`v:${row.id}`, () => transcodeVideo(row.id, { posterOnly: true }));
+  }
+  if (noPoster?.length) console.log(`[sweep] ${noPoster.length} video(s) missing a poster`);
 
   // Clearing watermark_error is what makes a failed row eligible again — see
   // the guard in watermarkSubmission.
